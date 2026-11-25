@@ -75,13 +75,14 @@ def _build_user_prompt(
 ) -> str:
     """Construct a compact prompt with untrusted webpage data isolated in tags."""
     element_lines: list[str] = []
-    seen_texts: set[str] = set()
+    seen_link_texts: set[str] = set()
     for el in elements:
         compact_text = " ".join(el.text.split())[:MAX_ELEMENT_TEXT_LEN]
         safe_text = _sanitize_tag_breakout(compact_text)
-        if safe_text in seen_texts:
-            continue
-        seen_texts.add(safe_text)
+        if el.tag.lower() == "a":
+            if safe_text in seen_link_texts:
+                continue
+            seen_link_texts.add(safe_text)
         element_lines.append(f"{el.id}|{el.tag}|{safe_text}")
         if len(element_lines) >= MAX_ELEMENTS:
             break
@@ -130,11 +131,15 @@ def _parse_action(raw_content: Any, elements: list[DOMElement]) -> BrowserAction
     cleaned = _strip_code_fences(raw_content)
     action = BrowserAction.model_validate_json(cleaned)
 
-    if action.selector is None and action.element_id is not None:
-        for el in elements:
-            if el.id == action.element_id:
-                action.selector = el.selector
-                break
+    if action.element_id is not None:
+        element_map = {el.id: el.selector for el in elements}
+        if action.element_id not in element_map:
+            return BrowserAction(
+                action_type="halt",
+                reason=f"Invalid element_id {action.element_id}",
+            )
+        if action.selector is None:
+            action.selector = element_map[action.element_id]
 
     return action
 
