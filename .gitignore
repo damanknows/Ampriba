@@ -6,3 +6,5 @@ venv/
 logs/
 screenshots/
 .pytest_cache/
+*.log
+scratch/
