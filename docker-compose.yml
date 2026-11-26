@@ -1,0 +1,61 @@
+services:
+  supplier_a:
+    build:
+      context: .
+      dockerfile: portals/Dockerfile
+    command: ["python", "-m", "portals.supplier_a"]
+    ports:
+      # Keep host and container ports synchronized with SUPPLIER_A_PORT in shared/config.py.
+      - "8001:8001"
+    restart: unless-stopped
+    stop_grace_period: 10s
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/openapi.json', timeout=3).read(1)"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    networks:
+      - supplier-net
+
+  supplier_b:
+    build:
+      context: .
+      dockerfile: portals/Dockerfile
+    command: ["python", "-m", "portals.supplier_b"]
+    ports:
+      # Keep host and container ports synchronized with SUPPLIER_B_PORT in shared/config.py.
+      - "8002:8002"
+    restart: unless-stopped
+    stop_grace_period: 10s
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8002/openapi.json', timeout=3).read(1)"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    networks:
+      - supplier-net
+
+  supplier_c:
+    build:
+      context: .
+      dockerfile: portals/Dockerfile
+    command: ["python", "-m", "portals.supplier_c"]
+    ports:
+      # Keep host and container ports synchronized with SUPPLIER_C_PORT in shared/config.py.
+      - "8003:8003"
+    restart: unless-stopped
+    stop_grace_period: 10s
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8003/openapi.json', timeout=3).read(1)"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    networks:
+      - supplier-net
+
+networks:
+  supplier-net:
+    driver: bridge
