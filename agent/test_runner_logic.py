@@ -8,13 +8,17 @@ from agent.runner import (
     _RunnerState,
     _SupplierAborted,
     _RunHalted,
+    _candidate_search_queries,
     _detect_captcha,
     _execute_pipeline,
     _extract_item_metrics,
+    _find_element,
+    _setup_supplier_context,
     parse_price,
     parse_shipping_address,
     parse_stock,
     pick_best_supplier,
+    run,
 )
 from agent.stubs import FakeKillSwitch, fake_policy, fake_sanitize
 from shared.schemas import AuditEvent, BrowserAction, DOMElement, PolicyVerdict, ShoppingTask
@@ -87,8 +91,12 @@ def test_detect_captcha_and_extract_item_metrics():
     assert _detect_captcha("http://localhost:8002/captcha", "What is 3 + 4?", "") is True
     assert _detect_captcha("http://localhost:8002/", "Verify you are human", "") is True
     assert _detect_captcha("http://localhost:8002/", "Please complete CAPTCHA", "") is True
-    # Normal Supplier B catalog page has "Verification" link, not "captcha" text
-    assert _detect_captcha("http://localhost:8002/", "GREENFIELD SUPPLY Shop Cart Verification", "") is False
+    # Normal Supplier B catalog page has "Verification" link and CSS .captcha-box in raw_text, not visible captcha text
+    assert _detect_captcha(
+        "http://localhost:8002/",
+        "GREENFIELD SUPPLY Shop Cart Verification",
+        ".captcha-box{padding:20px} GREENFIELD SUPPLY",
+    ) is False
 
     price, stock = _extract_item_metrics("Printer Paper 42 available ₹480 Add to Cart", "Printer Paper")
     assert price == 480.0
@@ -252,3 +260,100 @@ async def test_pipeline_kill_switch_and_repeat_guard():
     with pytest.raises(_RunHalted):
         await _execute_pipeline(state2, "A", action, target_text="Same")
     assert "repeated more than 3 times" in state2.terminal_reason
+
+
+def test_parse_price_and_pick_best_supplier_bad_inputs():
+    assert parse_price(None) is None
+    assert parse_price(123) is None
+    assert parse_price("₹") is None
+
+    assert pick_best_supplier({}, [], 1000.0) is None
+    assert pick_best_supplier({"A": 400}, [], -50.0) is None
+    assert pick_best_supplier({"A": 400}, [], float("nan")) is None
+    assert pick_best_supplier({"A": {"Printer Paper": 400}}, [], 1000.0, required_items=[]) is None
+    assert pick_best_supplier({"A": True}, [], 1000.0) is None
+
+
+def test_candidate_search_queries_and_find_element_priority():
+    queries = _candidate_search_queries("A4 Printer Paper")
+    assert queries[0] == "A4 Printer Paper"
+    assert "Printer Paper" in queries
+    assert "Paper" in queries
+
+    elements = [
+        DOMElement(id=1, tag="input", text="Search products | Search office supplies", selector="#product-search"),
+        DOMElement(id=2, tag="button", text="Search", selector="button"),
+        DOMElement(id=3, tag="input", text="", selector="#full-name"),
+    ]
+    btn = _find_element(elements, tags=("button", "input"), keywords=("search",))
+    assert btn is not None and btn.id == 2
+    name_input = _find_element(elements, tags=("input",), keywords=("full name",))
+    assert name_input is not None and name_input.id == 3
+
+
+@pytest.mark.asyncio
+async def test_setup_supplier_context_installs_firewall_on_context():
+    installed_contexts: list[object] = []
+
+    class DummyContextBM(_DummyBrowserManager):
+        def __init__(self) -> None:
+            super().__init__("about:blank", [], "", "")
+            self.context_count = 0
+
+        async def new_ephemeral_context(self, **kwargs) -> object:
+            self.context_count += 1
+            ctx = {"context_id": self.context_count, "kwargs": kwargs}
+            self.context = ctx
+            return ctx
+
+    bm = DummyContextBM()
+    state = _RunnerState(
+        task=ShoppingTask(items=["Printer Paper"], max_budget=600, shipping_address="42 Market Street, Pune, 411001"),
+        bm=bm,  # type: ignore[arg-type]
+        policy_check_fn=fake_policy,
+        audit_emit_fn=lambda _e: None,
+        sanitize_fn=fake_sanitize,
+        kill_switch=FakeKillSwitch(),
+        max_llm_calls=40,
+        install_firewall_fn=installed_contexts.append,
+    )
+    await _setup_supplier_context(state)
+    await _setup_supplier_context(state)
+    assert len(installed_contexts) == 2
+    assert installed_contexts[0]["context_id"] == 1
+    assert installed_contexts[1]["context_id"] == 2
+    assert installed_contexts[0]["kwargs"].get("service_workers") == "block"
+
+
+@pytest.mark.asyncio
+async def test_run_returns_status_on_bad_input():
+    res1 = await run(None, fake_policy, lambda _e: None)  # type: ignore[arg-type]
+    assert res1["status"] == "invalid_input"
+
+    res2 = await run(
+        ShoppingTask(items=[], max_budget=1000, shipping_address="42 Market Street, Pune, 411001"),
+        fake_policy,
+        lambda _e: None,
+    )
+    assert res2["status"] == "invalid_input"
+
+    res3 = await run(
+        ShoppingTask(items=["Printer Paper"], max_budget=-10, shipping_address="42 Market Street, Pune, 411001"),
+        fake_policy,
+        lambda _e: None,
+    )
+    assert res3["status"] == "invalid_input"
+
+    res4 = await run(
+        ShoppingTask(items=["Printer Paper"], max_budget=1000, shipping_address=""),
+        fake_policy,
+        lambda _e: None,
+    )
+    assert res4["status"] == "invalid_input"
+
+    res5 = await run(
+        ShoppingTask(items=["Printer Paper"], max_budget=1000, shipping_address="42 Market Street"),
+        None,  # type: ignore[arg-type]
+        lambda _e: None,
+    )
+    assert res5["status"] == "invalid_input"

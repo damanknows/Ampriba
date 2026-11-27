@@ -11,15 +11,19 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import inspect
 import json
+import math
 from pathlib import Path
 import re
 import sys
 from typing import Any, Callable
+from urllib.parse import quote_plus
 
 # Ensure project root is in sys.path when running this module directly
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+
+from pydantic import ValidationError
 
 from agent.browser import BrowserManager
 from agent.planner import next_action
@@ -39,9 +43,9 @@ _PINCODE_RE = re.compile(r"\b(\d{6})\b")
 _PHONE_RE = re.compile(r"(\+?\d[\d\s()-]{8,14}\d)")
 
 
-def parse_price(text: str) -> float | None:
+def parse_price(text: Any) -> float | None:
     """Parse a currency amount (handling ₹ and commas) from visible text."""
-    if not text:
+    if not isinstance(text, str) or not text:
         return None
     match = _PRICE_RUPEE_RE.search(text)
     if match is None:
@@ -55,9 +59,9 @@ def parse_price(text: str) -> float | None:
         return None
 
 
-def parse_stock(text: str) -> int | None:
+def parse_stock(text: Any) -> int | None:
     """Parse available stock count from portal stock labels ('in stock' or 'available')."""
-    if not text:
+    if not isinstance(text, str) or not text:
         return None
     match = _STOCK_RE.search(text)
     if match is None:
@@ -70,7 +74,7 @@ def parse_stock(text: str) -> int | None:
 
 def parse_shipping_address(shipping_address: str) -> dict[str, str]:
     """Extract shipping form fields from a freeform ShoppingTask.shipping_address string."""
-    raw = shipping_address.strip()
+    raw = shipping_address.strip() if isinstance(shipping_address, str) else ""
     pincode = "411001"
     phone = "9876543210"
 
@@ -87,7 +91,12 @@ def parse_shipping_address(shipping_address: str) -> dict[str, str]:
             raw = (raw[: phone_match.start()] + " " + raw[phone_match.end() :]).strip()
 
     parts = [
-        re.sub(r"^(?:name|full name|phone|address|city|state|pin|pincode)\s*:\s*", "", part.strip(), flags=re.IGNORECASE)
+        re.sub(
+            r"^(?:name|full name|phone|address|city|state|pin|pincode)\s*:\s*",
+            "",
+            part.strip(),
+            flags=re.IGNORECASE,
+        )
         for part in re.split(r"[,;\n]+", raw)
     ]
     parts = [p for p in parts if p]
@@ -130,15 +139,28 @@ def parse_shipping_address(shipping_address: str) -> dict[str, str]:
     }
 
 
+def _is_valid_number(value: Any) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+    )
+
+
 def pick_best_supplier(
     prices_found: dict[str, dict[str, float] | float | int],
-    unsafe_suppliers: set[str] | list[str] | tuple[str, ...],
+    unsafe_suppliers: set[str] | list[str] | tuple[str, ...] | None,
     max_budget: float,
     required_items: list[str] | None = None,
     stock_found: dict[str, dict[str, int]] | None = None,
 ) -> str | None:
     """Return the cheapest safe supplier fitting max_budget, or None if none qualify."""
-    unsafe = set(unsafe_suppliers)
+    if not isinstance(prices_found, dict) or not _is_valid_number(max_budget) or max_budget < 0:
+        return None
+    if required_items is not None and len(required_items) == 0:
+        return None
+
+    unsafe = set(unsafe_suppliers or ())
     best_supplier: str | None = None
     best_total: float | None = None
 
@@ -150,7 +172,7 @@ def pick_best_supplier(
             if not entry:
                 continue
             if required_items is not None:
-                if any(entry.get(item) is None for item in required_items):
+                if any(not _is_valid_number(entry.get(item)) or float(entry[item]) < 0 for item in required_items):
                     continue
                 if stock_found is not None:
                     supplier_stock = stock_found.get(supplier, {})
@@ -158,13 +180,15 @@ def pick_best_supplier(
                         continue
                 total = sum(float(entry[item]) for item in required_items)
             else:
+                if any(not _is_valid_number(v) or float(v) < 0 for v in entry.values()):
+                    continue
                 total = sum(float(v) for v in entry.values())
-        elif isinstance(entry, (int, float)):
+        elif _is_valid_number(entry) and float(entry) >= 0:
             total = float(entry)
         else:
             continue
 
-        if total > max_budget:
+        if total > float(max_budget):
             continue
 
         if best_total is None or total < best_total:
@@ -174,26 +198,67 @@ def pick_best_supplier(
     return best_supplier
 
 
+def _candidate_search_queries(item: str) -> list[str]:
+    """Generate search queries trying the full item name first, then shorter keywords."""
+    cleaned = " ".join(item.split()).strip()
+    if not cleaned:
+        return []
+
+    queries: list[str] = [cleaned]
+    seen: set[str] = {cleaned.lower()}
+
+    words = [w.strip(",.;:-_()[]{}") for w in cleaned.split()]
+    words = [w for w in words if w]
+
+    if len(words) > 1:
+        # Contiguous shorter sub-phrases from longer to shorter (trailing phrases first)
+        for length in range(len(words) - 1, 1, -1):
+            for start in range(len(words) - length, -1, -1):
+                phrase = " ".join(words[start : start + length])
+                if phrase.lower() not in seen:
+                    seen.add(phrase.lower())
+                    queries.append(phrase)
+
+        # Individual words: head noun is typically at the end, prefer length >= 3
+        for word in reversed(words):
+            if len(word) >= 3 and word.lower() not in seen:
+                seen.add(word.lower())
+                queries.append(word)
+        for word in reversed(words):
+            if word.lower() not in seen:
+                seen.add(word.lower())
+                queries.append(word)
+
+    return queries
+
+
 def _detect_captcha(url: str, visible_text: str, raw_text: str) -> bool:
     """Detect whether the current page is a CAPTCHA / human verification challenge."""
     if "/captcha" in url.lower():
         return True
-    combined = f"{visible_text}\n{raw_text}"
-    lowered = combined.lower()
-    if "verify you are human" in lowered:
+    if "verify you are human" in visible_text.lower() or "verify you are human" in raw_text.lower():
         return True
-    if _CAPTCHA_TEXT_RE.search(combined):
+    if _CAPTCHA_TEXT_RE.search(visible_text):
         return True
     return False
 
 
-def _extract_item_metrics(visible_text: str, item_name: str) -> tuple[float | None, int | None]:
+def _extract_item_metrics(
+    visible_text: str,
+    item_name: str,
+    matched_query: str | None = None,
+) -> tuple[float | None, int | None]:
     """Read price and stock for *item_name* from visible page text."""
     lowered = visible_text.lower()
     if "no products found" in lowered or "no matching supplies" in lowered:
         return None, 0
 
     idx = lowered.find(item_name.lower())
+    if idx < 0 and matched_query:
+        idx = lowered.find(matched_query.lower())
+    if idx < 0 and "₹" not in visible_text:
+        return None, 0
+
     snippet = visible_text[idx:] if idx >= 0 else visible_text
     price = parse_price(snippet)
     stock = parse_stock(snippet)
@@ -206,17 +271,30 @@ def _find_element(
     tags: tuple[str, ...],
     keywords: tuple[str, ...],
     exclude: tuple[str, ...] = (),
+    exclude_ids: set[int] | None = None,
 ) -> DOMElement | None:
-    """Find the first matching element generically by tag and label/text keywords."""
-    tag_set = {t.lower() for t in tags}
-    for el in elements:
-        if el.tag.lower() not in tag_set:
-            continue
-        text_lower = el.text.lower()
-        if any(ex in text_lower for ex in exclude):
-            continue
-        if any(kw in text_lower for kw in keywords):
-            return el
+    """Find the first matching element generically by tag priority and label/text/selector."""
+    blocked_ids = exclude_ids or set()
+    for wanted_tag in tags:
+        tag_lower = wanted_tag.lower()
+        # First pass: match visible/label text
+        for el in elements:
+            if el.id in blocked_ids or el.tag.lower() != tag_lower:
+                continue
+            text_lower = el.text.lower()
+            if any(ex in text_lower for ex in exclude):
+                continue
+            if any(kw in text_lower for kw in keywords):
+                return el
+        # Second pass: fallback to normalized selector (e.g. name/id attributes)
+        for el in elements:
+            if el.id in blocked_ids or el.tag.lower() != tag_lower:
+                continue
+            sel_norm = re.sub(r"[-_]+", " ", el.selector.lower())
+            if any(ex in sel_norm for ex in exclude):
+                continue
+            if any(kw in sel_norm for kw in keywords):
+                return el
     return None
 
 
@@ -229,6 +307,7 @@ class _RunnerState:
     sanitize_fn: Callable[..., Any]
     kill_switch: Any
     max_llm_calls: int
+    install_firewall_fn: Callable[..., Any] | None = None
     step_count: int = 0
     llm_calls: int = 0
     total_tokens: int = 0
@@ -237,6 +316,7 @@ class _RunnerState:
     unsafe_reasons: dict[str, str] = field(default_factory=dict)
     prices_found: dict[str, dict[str, float]] = field(default_factory=dict)
     stock_found: dict[str, dict[str, int]] = field(default_factory=dict)
+    matched_queries: dict[str, dict[str, str]] = field(default_factory=dict)
     terminal_status: str | None = None
     terminal_reason: str = ""
 
@@ -257,6 +337,21 @@ async def _maybe_await(result: Any) -> Any:
     if inspect.isawaitable(result):
         return await result
     return result
+
+
+async def _setup_supplier_context(state: _RunnerState) -> None:
+    """Create a fresh browser context for a supplier and install the firewall if provided."""
+    sig = inspect.signature(state.bm.new_ephemeral_context)
+    accepts_kwargs = any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+    )
+    if accepts_kwargs or "service_workers" in sig.parameters:
+        context = await state.bm.new_ephemeral_context(service_workers="block")
+    else:
+        context = await state.bm.new_ephemeral_context()
+
+    if state.install_firewall_fn is not None and context is not None:
+        await _maybe_await(state.install_firewall_fn(context))
 
 
 async def _inspect_page_safety(
@@ -320,12 +415,25 @@ async def _execute_pipeline(
         raise _RunHalted()
 
     # Extract elements & raw text and run CAPTCHA + sanitize checks on the current page.
-    await _inspect_page_safety(state, supplier)
+    clean_elements, _, _ = await _inspect_page_safety(state, supplier)
+
+    # Refresh target_text from live extracted elements if possible
+    resolved_target_text = target_text
+    if action.element_id is not None:
+        live_el = next((el for el in clean_elements if el.id == action.element_id), None)
+        if live_el is not None:
+            resolved_target_text = live_el.text
+    elif action.selector:
+        live_el = next((el for el in clean_elements if el.selector == action.selector), None)
+        if live_el is not None:
+            resolved_target_text = live_el.text
 
     state.step_count += 1
     step_num = state.step_count
 
-    verdict: PolicyVerdict = await _maybe_await(state.policy_check_fn(action, target_text))
+    verdict: PolicyVerdict = await _maybe_await(
+        state.policy_check_fn(action, resolved_target_text)
+    )
     screenshot_path: str | None = None
     if state.bm.page is not None:
         screenshot_path = await state.bm.save_screenshot(step_num=step_num, name=supplier.lower())
@@ -384,7 +492,9 @@ async def _execute_pipeline(
         state.terminal_reason = action.reason
         raise _RunHalted()
 
-    state.history.append(f"{supplier}:{action.action_type}:{target_text or action.url or action.selector}")
+    state.history.append(
+        f"{supplier}:{action.action_type}:{resolved_target_text or action.url or action.selector}"
+    )
 
 
 async def _llm_fallback_step(state: _RunnerState, supplier: str) -> None:
@@ -403,6 +513,10 @@ async def _llm_fallback_step(state: _RunnerState, supplier: str) -> None:
     target_text = None
     if action.element_id is not None:
         matched = next((el for el in clean_elements if el.id == action.element_id), None)
+        if matched is not None:
+            target_text = matched.text
+    elif action.selector:
+        matched = next((el for el in clean_elements if el.selector == action.selector), None)
         if matched is not None:
             target_text = matched.text
 
@@ -429,9 +543,25 @@ async def _login_supplier(state: _RunnerState, supplier: str, base_url: str) -> 
         if "/login" not in current_url.lower():
             return
 
-        user_el = _find_element(clean_elements, tags=("input",), keywords=("username", "user", "email"), exclude=("password",))
-        pass_el = _find_element(clean_elements, tags=("input",), keywords=("password",))
-        login_btn = _find_element(clean_elements, tags=("button", "input"), keywords=("sign in", "log in", "login"))
+        user_el = _find_element(
+            clean_elements,
+            tags=("input",),
+            keywords=("username", "user", "email"),
+            exclude=("password",),
+        )
+        pass_el = _find_element(
+            clean_elements,
+            tags=("input",),
+            keywords=("password",),
+            exclude_ids={user_el.id} if user_el else None,
+        )
+        used_ids = {el.id for el in (user_el, pass_el) if el is not None}
+        login_btn = _find_element(
+            clean_elements,
+            tags=("button", "input"),
+            keywords=("sign in", "log in", "login"),
+            exclude_ids=used_ids,
+        )
 
         if user_el and pass_el and login_btn:
             await _execute_pipeline(
@@ -469,115 +599,136 @@ async def _login_supplier(state: _RunnerState, supplier: str, base_url: str) -> 
                 ),
                 target_text=login_btn.text,
             )
-            return
-
-        await _llm_fallback_step(state, supplier)
-
-
-async def _search_item(state: _RunnerState, supplier: str, base_url: str, item: str) -> None:
-    """Ensure we are on the catalog page and search for *item*."""
-    current_url = state.bm.page.url if state.bm.page is not None else ""
-    if not current_url.startswith(base_url) or any(seg in current_url for seg in ("/login", "/cart", "/checkout")):
-        await _execute_pipeline(
-            state,
-            supplier,
-            BrowserAction(action_type="navigate", url=f"{base_url}/", reason=f"Open {supplier} catalog"),
-        )
-
-    for _ in range(3):
-        clean_elements, _, _ = await _inspect_page_safety(state, supplier)
-        search_input = _find_element(clean_elements, tags=("input",), keywords=("search",))
-        search_btn = _find_element(clean_elements, tags=("button", "input"), keywords=("search",))
-        if search_input and search_btn:
-            await _execute_pipeline(
-                state,
-                supplier,
-                BrowserAction(
-                    action_type="type",
-                    element_id=search_input.id,
-                    selector=search_input.selector,
-                    value=item,
-                    reason=f"Search for {item}",
-                ),
-                target_text=search_input.text,
-            )
-            await _execute_pipeline(
-                state,
-                supplier,
-                BrowserAction(
-                    action_type="click",
-                    element_id=search_btn.id,
-                    selector=search_btn.selector,
-                    reason=f"Submit search for {item}",
-                ),
-                target_text=search_btn.text,
-            )
-            return
-
-        await _llm_fallback_step(state, supplier)
-
-
-async def _phase1_recon_suppliers(state: _RunnerState) -> None:
-    """Phase 1: For each supplier, log in, search every item, and record price & stock."""
-    for supplier, base_url in SUPPLIER_URLS.items():
-        try:
-            await _login_supplier(state, supplier, base_url)
-            state.prices_found[supplier] = {}
-            state.stock_found[supplier] = {}
-
-            for item in state.task.items:
-                await _search_item(state, supplier, base_url, item)
-                _, visible_text, _ = await _inspect_page_safety(state, supplier)
-                price, stock = _extract_item_metrics(visible_text, item)
-                if price is not None:
-                    state.prices_found[supplier][item] = price
-                if stock is not None:
-                    state.stock_found[supplier][item] = stock
-        except _SupplierAborted:
             continue
 
+        await _llm_fallback_step(state, supplier)
 
-async def _phase3_4_checkout(state: _RunnerState, supplier: str) -> None:
-    """Phase 3 & 4: Add items, open checkout, fill shipping, and stop before final pay."""
-    base_url = SUPPLIER_URLS[supplier]
 
-    # Ensure logged in on chosen supplier (handles returning from another supplier cleanly)
+async def _search_query(state: _RunnerState, supplier: str, base_url: str, query: str) -> None:
+    """Search the supplier catalog using the ?q= query endpoint, falling back to form/LLM if needed."""
+    search_url = f"{base_url}/?q={quote_plus(query)}"
     await _execute_pipeline(
         state,
         supplier,
-        BrowserAction(action_type="navigate", url=f"{base_url}/", reason=f"Return to {supplier} catalog"),
+        BrowserAction(action_type="navigate", url=search_url, reason=f"Search {supplier} for {query}"),
     )
-    if state.bm.page is not None and "/login" in state.bm.page.url.lower():
+
+    current_url = state.bm.page.url if state.bm.page is not None else ""
+    if "/login" in current_url.lower():
         await _login_supplier(state, supplier, base_url)
+        await _execute_pipeline(
+            state,
+            supplier,
+            BrowserAction(action_type="navigate", url=search_url, reason=f"Search {supplier} for {query}"),
+        )
+
+
+async def _phase1_recon_suppliers(state: _RunnerState) -> None:
+    """Phase 1: For each supplier, use a fresh context, log in, search each item, and read price & stock."""
+    for supplier, base_url in SUPPLIER_URLS.items():
+        try:
+            await _setup_supplier_context(state)
+            await _login_supplier(state, supplier, base_url)
+            state.prices_found[supplier] = {}
+            state.stock_found[supplier] = {}
+            state.matched_queries[supplier] = {}
+
+            for item in state.task.items:
+                for query in _candidate_search_queries(item):
+                    await _search_query(state, supplier, base_url, query)
+                    _, visible_text, _ = await _inspect_page_safety(state, supplier)
+                    price, stock = _extract_item_metrics(visible_text, item, matched_query=query)
+                    if price is not None:
+                        state.prices_found[supplier][item] = price
+                        if stock is not None:
+                            state.stock_found[supplier][item] = stock
+                        state.matched_queries[supplier][item] = query
+                        break
+                    if stock is not None and item not in state.stock_found[supplier]:
+                        state.stock_found[supplier][item] = stock
+        except _SupplierAborted:
+            continue
+        except _RunHalted:
+            raise
+        except Exception as exc:
+            state.mark_unsafe(supplier, f"Supplier check failed: {exc}")
+            continue
+
+
+def _pick_add_to_cart_button(
+    elements: list[DOMElement],
+    item: str,
+    query: str,
+) -> DOMElement | None:
+    """Find the Add to Cart button, preferring a match for *item*/*query* when multiple exist."""
+    candidates = [
+        el
+        for el in elements
+        if el.tag.lower() in {"button", "input"}
+        and "add to cart" in el.text.lower()
+    ]
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+
+    keywords = [w.lower() for w in f"{item} {query}".split() if len(w) >= 3]
+    for el in candidates:
+        haystack = f"{el.text} {el.selector}".lower()
+        if any(kw in haystack for kw in keywords):
+            return el
+    return candidates[0]
+
+
+async def _phase3_4_checkout(state: _RunnerState, supplier: str) -> None:
+    """Phase 3 & 4: Fresh context on chosen supplier, add items, open checkout, fill shipping, stop before final pay."""
+    base_url = SUPPLIER_URLS[supplier]
+    await _setup_supplier_context(state)
+    await _login_supplier(state, supplier, base_url)
 
     for item in state.task.items:
-        await _search_item(state, supplier, base_url, item)
-        for _ in range(3):
-            clean_elements, _, _ = await _inspect_page_safety(state, supplier)
-            add_btn = _find_element(clean_elements, tags=("button",), keywords=("add to cart",))
-            if add_btn:
-                await _execute_pipeline(
-                    state,
-                    supplier,
-                    BrowserAction(
-                        action_type="click",
-                        element_id=add_btn.id,
-                        selector=add_btn.selector,
-                        reason=f"Add {item} to cart",
-                    ),
-                    target_text=add_btn.text,
-                )
+        preferred = state.matched_queries.get(supplier, {}).get(item)
+        queries = [preferred] if preferred else _candidate_search_queries(item)
+        added = False
+
+        for query in queries:
+            await _search_query(state, supplier, base_url, query)
+            for _ in range(3):
+                clean_elements, _, _ = await _inspect_page_safety(state, supplier)
+                add_btn = _pick_add_to_cart_button(clean_elements, item, query)
+                if add_btn is not None:
+                    await _execute_pipeline(
+                        state,
+                        supplier,
+                        BrowserAction(
+                            action_type="click",
+                            element_id=add_btn.id,
+                            selector=add_btn.selector,
+                            reason=f"Add {item} to cart",
+                        ),
+                        target_text=add_btn.text,
+                    )
+                    added = True
+                    break
+                if len(queries) > 1:
+                    break
+                await _llm_fallback_step(state, supplier)
+            if added:
                 break
-            await _llm_fallback_step(state, supplier)
+
+        if not added:
+            state.terminal_status = "halted"
+            state.terminal_reason = f"Could not add '{item}' to cart on {supplier}."
+            raise _RunHalted()
 
     # Proceed from cart to checkout
-    for _ in range(3):
+    for _ in range(4):
         clean_elements, _, _ = await _inspect_page_safety(state, supplier)
         current_url = state.bm.page.url if state.bm.page is not None else ""
         if "/checkout" in current_url.lower():
             break
         checkout_el = _find_element(clean_elements, tags=("a", "button"), keywords=("checkout",))
-        if checkout_el:
+        if checkout_el is not None:
             await _execute_pipeline(
                 state,
                 supplier,
@@ -589,7 +740,14 @@ async def _phase3_4_checkout(state: _RunnerState, supplier: str) -> None:
                 ),
                 target_text=checkout_el.text,
             )
-            break
+            continue
+        if "/cart" not in current_url.lower():
+            await _execute_pipeline(
+                state,
+                supplier,
+                BrowserAction(action_type="navigate", url=f"{base_url}/cart", reason="Open cart"),
+            )
+            continue
         await _llm_fallback_step(state, supplier)
 
     # Fill shipping fields on /checkout
@@ -604,9 +762,16 @@ async def _phase3_4_checkout(state: _RunnerState, supplier: str) -> None:
     )
 
     clean_elements, _, _ = await _inspect_page_safety(state, supplier)
+    filled_ids: set[int] = set()
     for field_key, keywords in field_specs:
-        field_el = _find_element(clean_elements, tags=("input", "textarea"), keywords=keywords)
+        field_el = _find_element(
+            clean_elements,
+            tags=("input", "textarea"),
+            keywords=keywords,
+            exclude_ids=filled_ids,
+        )
         if field_el is not None:
+            filled_ids.add(field_el.id)
             await _execute_pipeline(
                 state,
                 supplier,
@@ -649,9 +814,76 @@ async def _phase3_4_checkout(state: _RunnerState, supplier: str) -> None:
 
 
 def _write_run_result(result: dict[str, Any]) -> None:
-    LOGS_DIR.mkdir(parents=True, exist_ok=True)
-    out_path = LOGS_DIR / "run_result.json"
-    out_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
+    try:
+        LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        out_path = LOGS_DIR / "run_result.json"
+        out_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _error_result(status: str, reason: str) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "status": status,
+        "chosen_supplier": None,
+        "prices_found": {},
+        "unsafe_suppliers": [],
+        "unsafe_reasons": {},
+        "total_tokens": 0,
+        "steps": 0,
+        "reason": reason,
+    }
+    _write_run_result(result)
+    return result
+
+
+def _validate_run_inputs(
+    task: Any,
+    policy_check_fn: Any,
+    audit_emit_fn: Any,
+    sanitize_fn: Any,
+    install_firewall_fn: Any,
+    max_llm_calls: Any,
+) -> tuple[ShoppingTask | None, str | None]:
+    """Validate inputs to run() without raising."""
+    if not callable(policy_check_fn):
+        return None, "policy_check_fn must be callable."
+    if not callable(audit_emit_fn):
+        return None, "audit_emit_fn must be callable."
+    if sanitize_fn is not None and not callable(sanitize_fn):
+        return None, "sanitize_fn must be callable when provided."
+    if install_firewall_fn is not None and not callable(install_firewall_fn):
+        return None, "install_firewall_fn must be callable when provided."
+    if isinstance(max_llm_calls, bool) or not isinstance(max_llm_calls, int) or max_llm_calls < 0:
+        return None, "max_llm_calls must be a non-negative integer."
+
+    parsed_task: ShoppingTask
+    if isinstance(task, ShoppingTask):
+        parsed_task = task
+    elif isinstance(task, dict):
+        try:
+            parsed_task = ShoppingTask.model_validate(task)
+        except ValidationError as exc:
+            return None, f"Invalid task payload: {exc}"
+    else:
+        return None, "task must be a ShoppingTask instance."
+
+    cleaned_items = [item.strip() for item in parsed_task.items if isinstance(item, str) and item.strip()]
+    if not cleaned_items or len(cleaned_items) != len(parsed_task.items):
+        return None, "task.items must be a non-empty list of non-empty strings."
+
+    if not _is_valid_number(parsed_task.max_budget) or float(parsed_task.max_budget) <= 0:
+        return None, "task.max_budget must be a positive finite number."
+
+    if not isinstance(parsed_task.shipping_address, str) or not parsed_task.shipping_address.strip():
+        return None, "task.shipping_address must be a non-empty string."
+
+    normalized_task = ShoppingTask(
+        items=cleaned_items,
+        max_budget=float(parsed_task.max_budget),
+        shipping_address=parsed_task.shipping_address.strip(),
+    )
+    return normalized_task, None
 
 
 async def run(
@@ -664,44 +896,61 @@ async def run(
     max_llm_calls: int = 40,
 ) -> dict[str, Any]:
     """Execute the multi-supplier shopping workflow with unified security enforcement."""
+    normalized_task, validation_error = _validate_run_inputs(
+        task,
+        policy_check_fn,
+        audit_emit_fn,
+        sanitize_fn,
+        install_firewall_fn,
+        max_llm_calls,
+    )
+    if validation_error is not None or normalized_task is None:
+        return _error_result("invalid_input", validation_error or "Invalid input.")
+
     chosen_supplier: str | None = None
+    state: _RunnerState | None = None
 
-    async with BrowserManager(headless=True) as bm:
-        if install_firewall_fn is not None and bm.page is not None:
-            await _maybe_await(install_firewall_fn(bm.page))
-
-        state = _RunnerState(
-            task=task,
-            bm=bm,
-            policy_check_fn=policy_check_fn,
-            audit_emit_fn=audit_emit_fn,
-            sanitize_fn=sanitize_fn or fake_sanitize,
-            kill_switch=kill_switch,
-            max_llm_calls=max_llm_calls,
-        )
-
-        try:
-            await _phase1_recon_suppliers(state)
-
-            chosen_supplier = pick_best_supplier(
-                state.prices_found,
-                list(state.unsafe_reasons.keys()),
-                task.max_budget,
-                required_items=task.items,
-                stock_found=state.stock_found,
+    try:
+        async with BrowserManager(headless=True) as bm:
+            state = _RunnerState(
+                task=normalized_task,
+                bm=bm,
+                policy_check_fn=policy_check_fn,
+                audit_emit_fn=audit_emit_fn,
+                sanitize_fn=sanitize_fn or fake_sanitize,
+                install_firewall_fn=install_firewall_fn,
+                kill_switch=kill_switch,
+                max_llm_calls=max_llm_calls,
             )
 
-            if chosen_supplier is None:
-                state.terminal_status = "halted"
-                state.terminal_reason = "No safe supplier fits max_budget and required items."
-            else:
-                await _phase3_4_checkout(state, chosen_supplier)
-        except _SupplierAborted:
-            state.terminal_status = "halted"
-            state.terminal_reason = "Chosen supplier became unsafe during checkout."
-        except _RunHalted:
-            pass
+            try:
+                await _phase1_recon_suppliers(state)
 
+                chosen_supplier = pick_best_supplier(
+                    state.prices_found,
+                    list(state.unsafe_reasons.keys()),
+                    normalized_task.max_budget,
+                    required_items=normalized_task.items,
+                    stock_found=state.stock_found,
+                )
+
+                if chosen_supplier is None:
+                    state.terminal_status = "halted"
+                    state.terminal_reason = "No safe supplier fits max_budget and required items."
+                else:
+                    await _phase3_4_checkout(state, chosen_supplier)
+            except _SupplierAborted:
+                state.terminal_status = "halted"
+                state.terminal_reason = "Chosen supplier became unsafe during checkout."
+            except _RunHalted:
+                pass
+    except Exception as exc:
+        if state is None:
+            return _error_result("error", f"Runner failed: {exc}")
+        state.terminal_status = "error"
+        state.terminal_reason = f"Runner failed: {exc}"
+
+    assert state is not None
     result: dict[str, Any] = {
         "status": state.terminal_status or "halted",
         "chosen_supplier": chosen_supplier,
