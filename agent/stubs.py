@@ -59,7 +59,7 @@ def fake_policy(action: BrowserAction, target_text: str | None = None) -> Policy
     if action.action_type == "click":
         haystack = " ".join(
             part
-            for part in (action.reason, target_text, action.selector, action.value)
+            for part in (target_text, action.selector)
             if part
         ).lower()
         for keyword in _APPROVAL_KEYWORDS:
@@ -84,34 +84,47 @@ def fake_audit(event: AuditEvent) -> None:
     print(event.model_dump_json())
 
 
-def fake_sanitize(elements: list[DOMElement]) -> tuple[list[DOMElement], list[str]]:
-    """Stub DOM sanitizer that flags and strips prompt-injection or external-URL elements."""
-    sanitized: list[DOMElement] = []
+def _scan_text_for_flags(text: str, source: str) -> list[str]:
+    """Scan a text string for prompt-injection phrases and off-list URLs."""
+    if not text:
+        return []
+    normalized_text = " ".join(text.lower().split())
+    found: list[str] = []
+
+    for phrase in _INJECTION_PHRASES:
+        if phrase in normalized_text:
+            found.append(f"{source} contains injection phrase '{phrase}'.")
+
+    for match in _URL_PATTERN.findall(text):
+        candidate_url = match.rstrip(".,;:!?")
+        if not _is_allowed_supplier_url(candidate_url):
+            found.append(f"{source} contains URL outside SUPPLIER_URLS: {candidate_url}")
+
+    return found
+
+
+def fake_sanitize(
+    elements: list[DOMElement],
+    page_text: str = "",
+) -> tuple[list[DOMElement], list[str]]:
+    """Stub DOM sanitizer scanning elements and page_text for injections or off-list URLs."""
+    clean_elements: list[DOMElement] = []
     flags: list[str] = []
 
     for element in elements:
-        normalized_text = " ".join(element.text.lower().split())
-        element_flags: list[str] = []
-
-        for phrase in _INJECTION_PHRASES:
-            if phrase in normalized_text:
-                element_flags.append(
-                    f"Element {element.id} ({element.selector}) contains injection phrase '{phrase}'."
-                )
-
-        for match in _URL_PATTERN.findall(element.text):
-            candidate_url = match.rstrip(".,;:!?")
-            if not _is_allowed_supplier_url(candidate_url):
-                element_flags.append(
-                    f"Element {element.id} ({element.selector}) contains URL outside SUPPLIER_URLS: {candidate_url}"
-                )
-
+        element_flags = _scan_text_for_flags(
+            element.text,
+            f"Element {element.id} ({element.selector})",
+        )
         if element_flags:
             flags.extend(element_flags)
         else:
-            sanitized.append(element)
+            clean_elements.append(element)
 
-    return sanitized, flags
+    if page_text:
+        flags.extend(_scan_text_for_flags(page_text, "Page text"))
+
+    return clean_elements, flags
 
 
 class FakeKillSwitch:

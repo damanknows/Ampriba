@@ -211,6 +211,51 @@ EXTRACT_ELEMENTS_JS = """() => {
     return results;
 }"""
 
+GET_VISIBLE_TEXT_JS = """() => {
+    const root = document.body || document.documentElement;
+    if (!root) {
+        return '';
+    }
+
+    const ignoredTags = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE']);
+    const isElementVisible = (el) => {
+        let curr = el;
+        while (curr && curr !== document.documentElement) {
+            if (ignoredTags.has(curr.tagName)) {
+                return false;
+            }
+            const style = window.getComputedStyle(curr);
+            if (
+                style.display === 'none' ||
+                style.visibility === 'hidden' ||
+                parseFloat(style.opacity) === 0
+            ) {
+                return false;
+            }
+            if (curr.hasAttribute('hidden') || curr.getAttribute('aria-hidden') === 'true') {
+                return false;
+            }
+            curr = curr.parentElement;
+        }
+        return true;
+    };
+
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    const chunks = [];
+    let node;
+    while ((node = walker.nextNode())) {
+        const text = (node.nodeValue || '').replace(/\\s+/g, ' ').trim();
+        if (!text) {
+            continue;
+        }
+        const parent = node.parentElement;
+        if (parent && isElementVisible(parent)) {
+            chunks.push(text);
+        }
+    }
+    return chunks.join(' ');
+}"""
+
 
 async def extract_elements(page: Page) -> list[DOMElement]:
     """Extract visible interactive elements (inputs, buttons, links, selects, textareas)
@@ -347,6 +392,26 @@ class BrowserManager:
             raise RuntimeError("No active page to extract elements from.")
         self._last_elements = await extract_elements(target_page)
         return self._last_elements
+
+    async def get_visible_text(self, page: Page | None = None, max_chars: int = 3000) -> str:
+        """Return visible page text, skipping display:none, visibility:hidden, and opacity:0."""
+        target_page = page or self.page
+        if target_page is None:
+            raise RuntimeError("No active page to extract visible text from.")
+        if max_chars <= 0:
+            return ""
+        text: str = await target_page.evaluate(GET_VISIBLE_TEXT_JS)
+        return " ".join(text.split())[:max_chars]
+
+    async def get_raw_text(self, page: Page | None = None) -> str:
+        """Return document.documentElement.textContent including hidden text."""
+        target_page = page or self.page
+        if target_page is None:
+            raise RuntimeError("No active page to extract raw text from.")
+        text: str = await target_page.evaluate(
+            "() => document.documentElement ? (document.documentElement.textContent || '') : ''"
+        )
+        return text
 
     async def save_screenshot(
         self,
