@@ -30,16 +30,31 @@ _INJECTION = re.compile(
 _URL = re.compile(
     r"(?:[a-z][a-z0-9+.-]*://|//|(?:javascript|data|file):)[^\s<>\"']*", re.I
 )
+_HIDDEN_STYLE = re.compile(
+    r"(?:display\s*:\s*none|visibility\s*:\s*hidden|"
+    r"opacity\s*:\s*0(?:\.0+)?(?![0-9.])|"
+    r"font-size\s*:\s*0(?:\.0+)?(?:px|em|rem|%)?(?![0-9.])|"
+    r"aria-hidden\s*=\s*['\"]?true)"
+)
+
+
+def _classify_text(text: str) -> list[str]:
+    """Return rule markers triggered by normalized text or selector metadata."""
+    normalized = unicodedata.normalize('NFKC', text).casefold()
+    normalized = ''.join(c for c in normalized if unicodedata.category(c) != 'Cf')
+    rules: list[str] = []
+    if _INJECTION.search(normalized):
+        rules.append('instruction_override')
+    if any(not is_allowed_url(m.group()) for m in _URL.finditer(normalized)):
+        rules.append('unauthorized_url')
+    if _HIDDEN_STYLE.search(normalized):
+        rules.append('hidden_style')
+    return rules
 
 
 def suspicious_content(text: str) -> str | None:
-    text = unicodedata.normalize('NFKC', text).casefold()
-    text = ''.join(c for c in text if unicodedata.category(c) != 'Cf')
-    if _INJECTION.search(text):
-        return 'instruction_override'
-    if any(not is_allowed_url(m.group()) for m in _URL.finditer(text)):
-        return 'unauthorized_url'
-    return None
+    rules = _classify_text(text)
+    return rules[0] if rules else None
 
 
 _SNAPSHOT = """selectors => {
@@ -83,13 +98,26 @@ async def sanitize_dom(
     for el, row in zip(elements, rows, strict=True):
         if row is None:
             continue
-        rule = suspicious_content(' '.join((row['text'], el.selector, row['tag'])))
-        if row['href'] and not is_allowed_url(row['href']):
-            rule = 'unauthorized_url'
-        if rule:
-            flags.append(f'{el.id}:{rule}')
+        rules = _classify_text(' '.join((row['text'], el.selector, row['tag'])))
+        if row['href'] and not is_allowed_url(row['href']) and 'unauthorized_url' not in rules:
+            rules.append('unauthorized_url')
+        if rules:
+            flags.extend(f'{el.id}:{rule}' for rule in rules)
         else:
             clean.append(DOMElement(id=el.id, selector=el.selector, tag=row['tag'], text=row['text']))
+    return clean, flags
+
+
+async def sanitize_fn(elements: list[DOMElement]) -> tuple[list[DOMElement], list[str]]:
+    """Signature used by Member 1's runner."""
+    clean: list[DOMElement] = []
+    flags: list[str] = []
+    for el in elements:
+        rules = _classify_text(' '.join((el.text, el.selector, el.tag)))
+        if rules:
+            flags.extend(f'{el.id}:{rule}' for rule in rules)
+        else:
+            clean.append(el)
     return clean, flags
 
 

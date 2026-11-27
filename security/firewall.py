@@ -1,8 +1,9 @@
 """Action policy and Playwright routing for the isolated shopping context."""
 
 import re
+import urllib.parse
 
-from playwright.async_api import Page, Route, WebSocketRoute
+from playwright.async_api import BrowserContext, Page, Route, WebSocketRoute
 
 from security.sanitizer import is_allowed_url, suspicious_content
 from shared.schemas import BrowserAction, PolicyVerdict
@@ -63,38 +64,55 @@ async def detect_captcha(page: Page) -> PolicyVerdict:
                          message="No CAPTCHA detected.")
 
 
-async def install_firewall(page: Page) -> None:
+async def install_firewall(context: BrowserContext | Page) -> None:
     """Install once per fresh context, before navigation, popups, or untrusted code.
 
-    Requires Playwright >= 1.48 and a context created with service_workers="block".
-    Do not install competing routes that continue requests. Discard the context
-    if installation fails. These routes govern browser HTTP(S) and WebSockets,
-    not arbitrary browser networking; use OS egress controls for hard isolation.
+    Accepts a BrowserContext (or a Page for backward compatibility, resolving
+    to its context). Requires Playwright >= 1.48 and a context created with
+    service_workers="block". Do not install competing routes that continue
+    requests. Discard the context if installation fails. These routes govern
+    browser HTTP(S) and WebSockets, not arbitrary browser networking; use OS
+    egress controls for hard isolation. 3xx are followed only when the resolved
+    Location is inside ALLOWED_ORIGINS; every hop is re-checked.
     """
+    if isinstance(context, Page):
+        context = context.context
+
     async def handle_request(route: Route) -> None:
         response = None
         try:
-            if is_allowed_url(route.request.url):
-                response = await route.fetch(max_redirects=0)
-                if not 300 <= response.status < 400:
-                    await route.fulfill(response=response)
-                    return
+            request_url = route.request.url
+            if not is_allowed_url(request_url):
+                await route.abort("blockedbyclient")
+                return
+
+            response = await route.fetch(max_redirects=0)
+            if 300 <= response.status < 400:
+                location = response.headers.get("location")
+                if location:
+                    target_url = urllib.parse.urljoin(request_url, location)
+                    if is_allowed_url(target_url):
+                        await route.continue_()
+                        return
+                await route.abort("blockedbyclient")
+                return
+
+            await route.fulfill(response=response)
         except Exception:
             # A failed check or fetch must never fall back to native networking.
             try:
                 await route.abort("blockedbyclient")
             except Exception:
                 pass
-            return
         finally:
             if response is not None:
                 await response.dispose()
-        await route.abort("blockedbyclient")
 
     async def block_socket(socket: WebSocketRoute) -> None:
         await socket.close(code=1008, reason="WebSockets are disabled")
 
-    await page.context.route_web_socket(re.compile(r".*"), block_socket)
-    # Page routes take precedence; the context route covers popup first requests.
-    await page.context.route("**/*", handle_request)
-    await page.route("**/*", handle_request)
+    await context.route_web_socket(re.compile(r".*"), block_socket)
+    await context.route("**/*", handle_request)
+
+
+install_firewall_fn = install_firewall
