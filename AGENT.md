@@ -35,13 +35,13 @@ Ampriba is an autonomous multi-portal procurement agent built for **Track 4**. G
 ## Token and Cost
 
 - **Happy path**: **0 LLM tokens** (all recon, cart, and checkout actions are handled deterministically).
-- **Fallback planner call**: **~600 tokens** per call (measured at **591 prompt tokens** and **53 completion tokens**).
+- **Fallback planner call**: about **400 tokens** per call on the local portals (**362 prompt tokens** and **39 completion tokens**; one measured call).
 - **Hard caps**: Bounded per run by `max_llm_calls` (default `40`) and `MAX_STEPS = 40` total actions.
 - **Cost-per-run formula**:
 
 $$\text{Cost}_{\text{run}} = \sum_{i=1}^{N_{\text{calls}}} \left( \frac{P_i}{1{,}000{,}000} \cdot r_{\text{in}} + \frac{C_i}{1{,}000{,}000} \cdot r_{\text{out}} \right)$$
 
-where $N_{\text{calls}} \le \text{max\_llm\_calls}$ is the number of LLM planner calls ($0$ on the happy path), $P_i \approx 591$ and $C_i \approx 53$ are prompt and completion tokens for call $i$, and $r_{\text{in}}, r_{\text{out}}$ are your configured model's rates per 1M input and output tokens.
+where $N_{\text{calls}} \le \text{max\_llm\_calls}$ is the number of LLM planner calls ($0$ on the happy path), $P_i \approx 362$ and $C_i \approx 39$ are prompt and completion tokens for call $i$, and $r_{\text{in}}, r_{\text{out}}$ are your configured model's rates per 1M input and output tokens.
 
 ## Safety Hooks
 
@@ -68,6 +68,7 @@ where $N_{\text{calls}} \le \text{max\_llm\_calls}$ is the number of LLM planner
 
 ## Known Limitations
 
-- **LLM fallback lightly tested**: The deterministic path handles standard portal flows, so `next_action` in `agent/planner.py` has limited end-to-end test coverage.
+- **LLM fallback lightly tested**: The deterministic path handles standard portal flows, so `next_action` in `agent/planner.py` has limited end-to-end test coverage; the LLM fallback was exercised in a forced scenario with a single decision.
+- **Blocked action marks supplier unsafe**: A blocked action marks the supplier unsafe, so one bad model output can disqualify a clean supplier.
 - **Firewall aborts same-origin 303 redirects**: The browser network firewall can abort legitimate same-origin `303` POST-redirect-GET navigations during form submissions.
 - **Local mock portals only**: Configured strictly for the three local FastAPI supplier portals (`localhost:8001`–`8003`), not arbitrary external e-commerce sites.
