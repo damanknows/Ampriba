@@ -914,16 +914,23 @@ async def _phase3_4_checkout(state: _RunnerState, supplier: str) -> None:
         state.terminal_reason = "Checkout filled; stopped before final payment button."
 
 
-def _write_run_result(result: dict[str, Any]) -> None:
+def _write_run_result(
+    result: dict[str, Any],
+    result_path: str | Path | None = None,
+) -> None:
     try:
-        LOGS_DIR.mkdir(parents=True, exist_ok=True)
-        out_path = LOGS_DIR / "run_result.json"
+        out_path = Path(result_path) if result_path is not None else LOGS_DIR / "run_result.json"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
     except Exception:
         pass
 
 
-def _error_result(status: str, reason: str) -> dict[str, Any]:
+def _error_result(
+    status: str,
+    reason: str,
+    result_path: str | Path | None = None,
+) -> dict[str, Any]:
     result: dict[str, Any] = {
         "status": status,
         "chosen_supplier": None,
@@ -934,7 +941,7 @@ def _error_result(status: str, reason: str) -> dict[str, Any]:
         "steps": 0,
         "reason": reason,
     }
-    _write_run_result(result)
+    _write_run_result(result, result_path=result_path)
     return result
 
 
@@ -995,6 +1002,7 @@ async def run(
     install_firewall_fn: Callable[..., Any] | None = None,
     kill_switch: Any = None,
     max_llm_calls: int = 40,
+    result_path: str | Path | None = LOGS_DIR / "run_result.json",
 ) -> dict[str, Any]:
     """Execute the multi-supplier shopping workflow with unified security enforcement."""
     normalized_task, validation_error = _validate_run_inputs(
@@ -1006,7 +1014,11 @@ async def run(
         max_llm_calls,
     )
     if validation_error is not None or normalized_task is None:
-        return _error_result("invalid_input", validation_error or "Invalid input.")
+        return _error_result(
+            "invalid_input",
+            validation_error or "Invalid input.",
+            result_path=result_path,
+        )
 
     chosen_supplier: str | None = None
     state: _RunnerState | None = None
@@ -1059,7 +1071,7 @@ async def run(
                 pass
     except Exception as exc:
         if state is None:
-            return _error_result("error", f"Runner failed: {exc}")
+            return _error_result("error", f"Runner failed: {exc}", result_path=result_path)
         state.terminal_status = "error"
         state.terminal_reason = f"Runner failed: {exc}"
 
@@ -1074,5 +1086,5 @@ async def run(
         "steps": state.step_count,
         "reason": state.terminal_reason,
     }
-    _write_run_result(result)
+    _write_run_result(result, result_path=result_path)
     return result

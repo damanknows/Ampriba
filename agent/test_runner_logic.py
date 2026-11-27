@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import inspect
+import json
+
 import pytest
 
 from agent.runner import (
+    LOGS_DIR,
     _RunnerState,
     _SupplierAborted,
     _RunHalted,
@@ -326,41 +330,55 @@ async def test_setup_supplier_context_installs_firewall_on_context():
 
 
 @pytest.mark.asyncio
-async def test_run_returns_status_on_bad_input():
-    res1 = await run(None, fake_policy, lambda _e: None)  # type: ignore[arg-type]
+async def test_run_returns_status_on_bad_input(tmp_path):
+    res1_path = tmp_path / "res1.json"
+    res1 = await run(None, fake_policy, lambda _e: None, result_path=res1_path)  # type: ignore[arg-type]
     assert res1["status"] == "invalid_input"
+    assert json.loads(res1_path.read_text(encoding="utf-8")) == res1
 
+    res2_path = tmp_path / "res2.json"
     res2 = await run(
         ShoppingTask(items=[], max_budget=1000, shipping_address="42 Market Street, Pune, 411001"),
         fake_policy,
         lambda _e: None,
+        result_path=res2_path,
     )
     assert res2["status"] == "invalid_input"
+    assert json.loads(res2_path.read_text(encoding="utf-8")) == res2
 
+    res3_path = tmp_path / "res3.json"
     res3 = await run(
         ShoppingTask(items=["Printer Paper"], max_budget=-10, shipping_address="42 Market Street, Pune, 411001"),
         fake_policy,
         lambda _e: None,
+        result_path=res3_path,
     )
     assert res3["status"] == "invalid_input"
+    assert json.loads(res3_path.read_text(encoding="utf-8")) == res3
 
+    res4_path = tmp_path / "res4.json"
     res4 = await run(
         ShoppingTask(items=["Printer Paper"], max_budget=1000, shipping_address=""),
         fake_policy,
         lambda _e: None,
+        result_path=res4_path,
     )
     assert res4["status"] == "invalid_input"
+    assert json.loads(res4_path.read_text(encoding="utf-8")) == res4
 
+    res5_path = tmp_path / "res5.json"
     res5 = await run(
         ShoppingTask(items=["Printer Paper"], max_budget=1000, shipping_address="42 Market Street"),
         None,  # type: ignore[arg-type]
         lambda _e: None,
+        result_path=res5_path,
     )
     assert res5["status"] == "invalid_input"
+    assert json.loads(res5_path.read_text(encoding="utf-8")) == res5
 
 
 @pytest.mark.asyncio
-async def test_run_logs_loud_warning_when_sanitize_fn_is_none(monkeypatch, caplog, capsys):
+async def test_run_logs_loud_warning_when_sanitize_fn_is_none(monkeypatch, caplog, capsys, tmp_path):
     class _FailingBM:
         def __init__(self, **_kwargs):
             pass
@@ -373,6 +391,7 @@ async def test_run_logs_loud_warning_when_sanitize_fn_is_none(monkeypatch, caplo
 
     monkeypatch.setattr("agent.runner.BrowserManager", _FailingBM)
 
+    out_path = tmp_path / "nested" / "run_result.json"
     with caplog.at_level("WARNING", logger="agent.runner"):
         with pytest.warns(RuntimeWarning, match="sanitize_fn=None"):
             res = await run(
@@ -380,9 +399,44 @@ async def test_run_logs_loud_warning_when_sanitize_fn_is_none(monkeypatch, caplo
                 fake_policy,
                 lambda _e: None,
                 sanitize_fn=None,
+                result_path=out_path,
             )
 
     assert res["status"] == "error"
+    assert json.loads(out_path.read_text(encoding="utf-8")) == res
     assert any("sanitize_fn=None" in rec.message for rec in caplog.records)
     captured = capsys.readouterr()
     assert "sanitize_fn=None" in captured.err
+
+
+@pytest.mark.asyncio
+async def test_run_writes_result_to_custom_result_path_and_has_default(monkeypatch, tmp_path):
+    assert inspect.signature(run).parameters["result_path"].default == LOGS_DIR / "run_result.json"
+
+    class _HaltedBM(_DummyBrowserManager):
+        def __init__(self, **_kwargs):
+            super().__init__("about:blank", [], "", "")
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+    async def _no_recon(_state):
+        return None
+
+    monkeypatch.setattr("agent.runner.BrowserManager", _HaltedBM)
+    monkeypatch.setattr("agent.runner._phase1_recon_suppliers", _no_recon)
+
+    custom_path = tmp_path / "custom_dir" / "result.json"
+    res = await run(
+        ShoppingTask(items=["Printer Paper"], max_budget=1000, shipping_address="42 Market Street, Pune, 411001"),
+        fake_policy,
+        lambda _e: None,
+        sanitize_fn=fake_sanitize,
+        result_path=str(custom_path),
+    )
+    assert res["status"] == "halted"
+    assert custom_path.exists()
+    assert json.loads(custom_path.read_text(encoding="utf-8")) == res
