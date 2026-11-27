@@ -357,3 +357,32 @@ async def test_run_returns_status_on_bad_input():
         lambda _e: None,
     )
     assert res5["status"] == "invalid_input"
+
+
+@pytest.mark.asyncio
+async def test_run_logs_loud_warning_when_sanitize_fn_is_none(monkeypatch, caplog, capsys):
+    class _FailingBM:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            raise RuntimeError("stop before browser launch")
+
+        async def __aexit__(self, *_args):
+            return None
+
+    monkeypatch.setattr("agent.runner.BrowserManager", _FailingBM)
+
+    with caplog.at_level("WARNING", logger="agent.runner"):
+        with pytest.warns(RuntimeWarning, match="sanitize_fn=None"):
+            res = await run(
+                ShoppingTask(items=["Printer Paper"], max_budget=1000, shipping_address="42 Market Street"),
+                fake_policy,
+                lambda _e: None,
+                sanitize_fn=None,
+            )
+
+    assert res["status"] == "error"
+    assert any("sanitize_fn=None" in rec.message for rec in caplog.records)
+    captured = capsys.readouterr()
+    assert "sanitize_fn=None" in captured.err

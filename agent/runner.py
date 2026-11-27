@@ -6,17 +6,20 @@ sanitization, auditing, network firewall, and kill switch hooks.
 
 from __future__ import annotations
 
+import asyncio
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import inspect
 import json
+import logging
 import math
 from pathlib import Path
 import re
 import sys
 from typing import Any, Callable
 from urllib.parse import quote_plus
+import warnings
 
 # Ensure project root is in sys.path when running this module directly
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -34,6 +37,7 @@ from shared.schemas import AuditEvent, BrowserAction, DOMElement, PolicyVerdict,
 MAX_STEPS = 40
 MAX_ACTION_REPEATS = 3
 LOGS_DIR = PROJECT_ROOT / "logs"
+logger = logging.getLogger(__name__)
 
 _PRICE_RUPEE_RE = re.compile(r"₹\s*([0-9][0-9,]*(?:\.[0-9]+)?)")
 _PRICE_NUM_RE = re.compile(r"([0-9][0-9,]*(?:\.[0-9]+)?)")
@@ -354,15 +358,114 @@ async def _setup_supplier_context(state: _RunnerState) -> None:
         await _maybe_await(state.install_firewall_fn(context))
 
 
+async def _click_and_settle(bm: BrowserManager, selector: str) -> None:
+    """Click *selector* and wait for any resulting navigation or firewall abort to settle."""
+    page = bm.page
+    if page is None or not hasattr(page, "on"):
+        await bm.click(selector)
+        if page is not None:
+            await page.wait_for_load_state("domcontentloaded")
+        return
+
+    nav_started = asyncio.Event()
+    nav_settled = asyncio.Event()
+    nav_failed = asyncio.Event()
+
+    def _on_request(req: Any) -> None:
+        try:
+            if req.is_navigation_request() and req.frame == page.main_frame:
+                nav_started.set()
+        except Exception:
+            pass
+
+    def _on_frame_navigated(frame: Any) -> None:
+        if nav_started.is_set() and frame == page.main_frame:
+            nav_settled.set()
+
+    def _on_request_failed(req: Any) -> None:
+        try:
+            if req.is_navigation_request() and req.frame == page.main_frame:
+                nav_failed.set()
+        except Exception:
+            pass
+
+    page.on("request", _on_request)
+    page.on("framenavigated", _on_frame_navigated)
+    page.on("requestfailed", _on_request_failed)
+    try:
+        await bm.click(selector)
+        if not nav_started.is_set():
+            try:
+                await asyncio.wait_for(nav_started.wait(), timeout=0.05)
+            except asyncio.TimeoutError:
+                pass
+        if nav_started.is_set():
+            if not nav_settled.is_set():
+                if nav_failed.is_set():
+                    try:
+                        await asyncio.wait_for(nav_settled.wait(), timeout=0.3)
+                    except asyncio.TimeoutError:
+                        pass
+                else:
+                    settled_task = asyncio.create_task(nav_settled.wait())
+                    failed_task = asyncio.create_task(nav_failed.wait())
+                    done, pending = await asyncio.wait(
+                        {settled_task, failed_task},
+                        timeout=3.0,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    for task in pending:
+                        task.cancel()
+                    if failed_task in done and not nav_settled.is_set():
+                        try:
+                            await asyncio.wait_for(nav_settled.wait(), timeout=0.3)
+                        except asyncio.TimeoutError:
+                            pass
+            try:
+                await page.wait_for_load_state("domcontentloaded", timeout=2000)
+            except Exception:
+                await asyncio.sleep(0.1)
+        else:
+            await page.wait_for_load_state("domcontentloaded")
+    finally:
+        for event_name, cb in (
+            ("request", _on_request),
+            ("framenavigated", _on_frame_navigated),
+            ("requestfailed", _on_request_failed),
+        ):
+            try:
+                page.remove_listener(event_name, cb)
+            except Exception:
+                pass
+
+
 async def _inspect_page_safety(
     state: _RunnerState,
     supplier: str,
 ) -> tuple[list[DOMElement], str, str]:
     """Extract elements, visible text, and raw text, and enforce CAPTCHA + sanitization."""
-    current_url = state.bm.page.url if state.bm.page is not None else ""
-    elements = await state.bm.extract_elements()
-    raw_text = await state.bm.get_raw_text()
-    visible_text = await state.bm.get_visible_text()
+    last_exc: Exception | None = None
+    for attempt in range(3):
+        try:
+            current_url = state.bm.page.url if state.bm.page is not None else ""
+            elements = await state.bm.extract_elements()
+            raw_text = await state.bm.get_raw_text()
+            visible_text = await state.bm.get_visible_text()
+            break
+        except Exception as exc:
+            last_exc = exc
+            if "Execution context was destroyed" in str(exc) and attempt < 2:
+                if state.bm.page is not None:
+                    try:
+                        await state.bm.page.wait_for_load_state("domcontentloaded", timeout=2000)
+                    except Exception:
+                        pass
+                await asyncio.sleep(0.1)
+                continue
+            raise
+    else:
+        assert last_exc is not None
+        raise last_exc
 
     if _detect_captcha(current_url, visible_text, raw_text):
         state.mark_unsafe(supplier, f"CAPTCHA detected at {current_url}")
@@ -478,9 +581,7 @@ async def _execute_pipeline(
     elif action.action_type == "click":
         if not action.selector:
             raise ValueError("click action requires selector")
-        await state.bm.click(action.selector)
-        if state.bm.page is not None:
-            await state.bm.page.wait_for_load_state("domcontentloaded")
+        await _click_and_settle(state.bm, action.selector)
     elif action.action_type == "type":
         if not action.selector or action.value is None:
             raise ValueError("type action requires selector and value")
@@ -910,6 +1011,18 @@ async def run(
     chosen_supplier: str | None = None
     state: _RunnerState | None = None
 
+    if sanitize_fn is None:
+        warning_msg = (
+            "WARNING: run() called with sanitize_fn=None; "
+            "falling back to stub fake_sanitize. Provide a real sanitize_fn in production!"
+        )
+        logger.warning(warning_msg)
+        warnings.warn(warning_msg, RuntimeWarning, stacklevel=2)
+        print(warning_msg, file=sys.stderr, flush=True)
+        effective_sanitize_fn = fake_sanitize
+    else:
+        effective_sanitize_fn = sanitize_fn
+
     try:
         async with BrowserManager(headless=True) as bm:
             state = _RunnerState(
@@ -917,7 +1030,7 @@ async def run(
                 bm=bm,
                 policy_check_fn=policy_check_fn,
                 audit_emit_fn=audit_emit_fn,
-                sanitize_fn=sanitize_fn or fake_sanitize,
+                sanitize_fn=effective_sanitize_fn,
                 install_firewall_fn=install_firewall_fn,
                 kill_switch=kill_switch,
                 max_llm_calls=max_llm_calls,
