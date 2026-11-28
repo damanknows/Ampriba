@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import multiprocessing
+import os
 import socket
 import sys
 import time
@@ -25,7 +26,12 @@ def _serve(module_name: str, port: int) -> None:
 
     module = importlib.import_module(module_name)
     application: Any = getattr(module, "app")
-    uvicorn.run(application, host="0.0.0.0", port=port, log_level="info")
+    uvicorn.run(
+        application,
+        host=os.getenv("AMPRIBA_BIND_HOST", "127.0.0.1"),
+        port=port,
+        log_level="info",
+    )
 
 
 def _find_port_collision() -> tuple[str, int] | None:

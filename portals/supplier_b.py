@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from html import escape
+import os
 import re
 import secrets
 from typing import Any
@@ -332,4 +333,8 @@ async def checkout(
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("portals.supplier_b:app", host="0.0.0.0", port=SUPPLIER_B_PORT)
+    uvicorn.run(
+        "portals.supplier_b:app",
+        host=os.getenv("AMPRIBA_BIND_HOST", "127.0.0.1"),
+        port=SUPPLIER_B_PORT,
+    )
