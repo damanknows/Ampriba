@@ -4,6 +4,8 @@ services:
       context: .
       dockerfile: portals/Dockerfile
     command: ["python", "-m", "portals.supplier_a"]
+    environment:
+      AMPRIBA_BIND_HOST: "0.0.0.0"
     ports:
       # Keep host and container ports synchronized with SUPPLIER_A_PORT in shared/config.py.
       - "8001:8001"
@@ -23,6 +25,8 @@ services:
       context: .
       dockerfile: portals/Dockerfile
     command: ["python", "-m", "portals.supplier_b"]
+    environment:
+      AMPRIBA_BIND_HOST: "0.0.0.0"
     ports:
       # Keep host and container ports synchronized with SUPPLIER_B_PORT in shared/config.py.
       - "8002:8002"
@@ -42,6 +46,8 @@ services:
       context: .
       dockerfile: portals/Dockerfile
     command: ["python", "-m", "portals.supplier_c"]
+    environment:
+      AMPRIBA_BIND_HOST: "0.0.0.0"
     ports:
       # Keep host and container ports synchronized with SUPPLIER_C_PORT in shared/config.py.
       - "8003:8003"

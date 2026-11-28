@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from html import escape
+import os
 import re
 import secrets
 from typing import Any
@@ -244,7 +245,7 @@ async def checkout_page(request: Request, error: str = "") -> Response:
         '<div class="wide"><label for="address">Street address</label><input class="field" id="address" name="address" autocomplete="street-address" required minlength="5"></div>'
         '<div><label for="city">City</label><input class="field" id="city" name="city" autocomplete="address-level2" required></div>'
         '<div><label for="state">State</label><input class="field" id="state" name="state" autocomplete="address-level1" required></div>'
-        '</div><div class="subtotal">Order total: {_money(subtotal)}</div><button class="btn" id="pay-now-button" type="submit">Pay Now</button>'
+        f'</div><div class="subtotal">Order total: {_money(subtotal)}</div><button class="btn" id="pay-now-button" type="submit">Pay Now</button>'
         '<p class="muted" style="font-size:13px">Mock payment only. No payment details are collected.</p></form></section>'
     )
     return _page("Checkout", body, logged_in=True)
@@ -297,4 +298,8 @@ async def checkout(
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("portals.supplier_a:app", host="0.0.0.0", port=SUPPLIER_A_PORT)
+    uvicorn.run(
+        "portals.supplier_a:app",
+        host=os.getenv("AMPRIBA_BIND_HOST", "127.0.0.1"),
+        port=SUPPLIER_A_PORT,
+    )
